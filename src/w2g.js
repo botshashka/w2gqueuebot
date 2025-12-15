@@ -7,6 +7,89 @@ function requireApiKey() {
   return process.env.W2G_API_KEY;
 }
 
+function youtubeIdFromUrl(urlString) {
+  try {
+    const url = new URL(urlString);
+    if (url.hostname === 'youtu.be') {
+      return url.pathname.slice(1);
+    }
+
+    if (url.hostname.includes('youtube.com')) {
+      if (url.searchParams.get('v')) {
+        return url.searchParams.get('v');
+      }
+      const pathParts = url.pathname.split('/').filter(Boolean);
+      // /shorts/<id> or /embed/<id> or /watch/<id>
+      if (pathParts.length >= 2) {
+        return pathParts[1];
+      }
+    }
+  } catch (_) {
+    return null;
+  }
+
+  return null;
+}
+
+function canonicalizeUrl(urlString) {
+  const youtubeId = youtubeIdFromUrl(urlString);
+  if (youtubeId) {
+    try {
+      const url = new URL(urlString);
+      const t = url.searchParams.get('t') || url.searchParams.get('start');
+      const canonical = new URL('https://www.youtube.com/watch');
+      canonical.searchParams.set('v', youtubeId);
+      if (t) {
+        canonical.searchParams.set('t', t);
+      }
+      return canonical.toString();
+    } catch (_) {
+      // fall through to original
+    }
+  }
+
+  return urlString;
+}
+
+async function fetchMetadata(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const res = await fetch(
+      `https://noembed.com/embed?url=${encodeURIComponent(url)}`,
+      { signal: controller.signal }
+    );
+    clearTimeout(timer);
+
+    if (!res.ok) return {};
+    const data = await res.json();
+
+    const meta = {
+      title: data.title,
+      thumbnail: data.thumbnail_url || data.thumbnail,
+    };
+
+    if (!meta.thumbnail) {
+      const youtubeId = youtubeIdFromUrl(url);
+      if (youtubeId) {
+        meta.thumbnail = `https://img.youtube.com/vi/${youtubeId}/hqdefault.jpg`;
+      }
+    }
+
+    return meta;
+  } catch (err) {
+    clearTimeout(timer);
+    console.warn('Failed to fetch metadata for', url, err);
+  }
+
+  const youtubeId = youtubeIdFromUrl(url);
+  if (youtubeId) {
+    return { title: undefined, thumbnail: `https://img.youtube.com/vi/${youtubeId}/hqdefault.jpg` };
+  }
+
+  return {};
+}
+
 async function createRoom(initialUrl) {
   const w2gApiKey = requireApiKey();
   const body = {
@@ -38,12 +121,17 @@ async function createRoom(initialUrl) {
 
 async function addToPlaylist(streamkey, url, title) {
   const w2gApiKey = requireApiKey();
+  const cleanedUrl = canonicalizeUrl(url);
+  const meta = await fetchMetadata(cleanedUrl);
   const body = {
     w2g_api_key: w2gApiKey,
     add_items: [
       {
-        url,
-        title: title || undefined,
+        url: cleanedUrl,
+        title: title || meta.title || undefined,
+        thumbnail: meta.thumbnail || undefined, // legacy param some clients use
+        img: meta.thumbnail || undefined, // legacy param some clients use
+        thumb: meta.thumbnail || undefined, // as per W2G API forum guidance
       },
     ],
   };

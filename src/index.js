@@ -13,6 +13,12 @@ if (!token || !botUsername || !process.env.W2G_API_KEY) {
 
 const bot = new Telegraf(token, { handlerTimeout: 30_000 });
 
+const PROMPT_GRACE_PERIOD_MS = 60_000;
+const PREVIOUS_MESSAGE_WINDOW_MS = 30_000;
+const promptWindows = new Map(); // chatId -> timestamp
+const lastUserMessages = new Map(); // chatId -> lightweight last message snapshot
+const usedMessagesByChat = new Map(); // chatId -> { set: Set<number>, queue: number[] }
+
 function getText(message) {
   return message?.text || message?.caption || '';
 }
@@ -44,30 +50,45 @@ function extractFromText(text) {
 function validateCandidate(url) {
   if (!url) return { url: null, invalid: false };
   try {
-    return { url: new URL(url).toString(), invalid: false };
+    const parsed = new URL(url);
+    // Only allow http/https
+    if (!['http:', 'https:'].includes(parsed.protocol.toLowerCase())) {
+      return { url: null, invalid: false };
+    }
+    return { url: parsed.toString(), invalid: false };
   } catch {
     return { url: null, invalid: true };
   }
 }
 
-function findUrl(ctx) {
+function findUrl(ctx, previousMessage) {
   const msg = ctx.message;
   const reply = msg?.reply_to_message;
+  const canUseReply = reply && !reply.from?.is_bot;
 
   const candidates = [
-    extractFromEntities(msg),
-    reply ? extractFromEntities(reply) : null,
-    extractFromText(getText(msg)),
-    reply ? extractFromText(getText(reply)) : null,
+    { raw: extractFromEntities(msg), sourceId: msg?.message_id },
+    { raw: canUseReply ? extractFromEntities(reply) : null, sourceId: canUseReply ? reply.message_id : null },
+    { raw: extractFromText(getText(msg)), sourceId: msg?.message_id },
+    { raw: canUseReply ? extractFromText(getText(reply)) : null, sourceId: canUseReply ? reply.message_id : null },
   ];
 
-  for (const raw of candidates) {
-    const result = validateCandidate(raw);
-    if (result.url) return result;
-    if (result.invalid) return result;
+  if (previousMessage) {
+    candidates.push(
+      { raw: extractFromEntities(previousMessage), sourceId: previousMessage.message_id },
+      { raw: extractFromText(getText(previousMessage)), sourceId: previousMessage.message_id }
+    );
   }
 
-  return { url: null, invalid: false };
+  for (const raw of candidates) {
+    const candidate = raw?.raw;
+    if (!candidate) continue;
+    const result = validateCandidate(candidate);
+    if (result.url) return { ...result, sourceMessageId: raw.sourceId || null };
+    if (result.invalid) return { ...result, sourceMessageId: raw.sourceId || null };
+  }
+
+  return { url: null, invalid: false, sourceMessageId: null };
 }
 
 function messageMentionsBot(message) {
@@ -101,8 +122,106 @@ function buildRoomLink(streamkey) {
   return `https://w2g.tv/rooms/${streamkey}`;
 }
 
+function markPrompt(chatId) {
+  promptWindows.set(chatId, Date.now());
+}
+
+function isWithinPromptWindow(chatId) {
+  const lastPrompt = promptWindows.get(chatId);
+  if (!lastPrompt) return false;
+  return Date.now() - lastPrompt <= PROMPT_GRACE_PERIOD_MS;
+}
+
+function consumePromptWindow(chatId) {
+  const active = isWithinPromptWindow(chatId);
+  if (active) {
+    promptWindows.delete(chatId);
+  }
+  return active;
+}
+
+function snapshotUserMessage(message) {
+  if (!message || !message.chat || !message.from || message.from.is_bot) return null;
+  const timestampMs = (message.date ? message.date * 1000 : Date.now());
+  return {
+    chatId: message.chat.id,
+    fromId: message.from.id,
+    date: timestampMs,
+    message_id: message.message_id,
+    text: message.text,
+    caption: message.caption,
+    entities: message.entities,
+    caption_entities: message.caption_entities,
+  };
+}
+
+function rememberLastUserMessage(message) {
+  const snapshot = snapshotUserMessage(message);
+  if (!snapshot) return;
+  lastUserMessages.set(snapshot.chatId, snapshot);
+}
+
+function recentPreviousMessage(chatId, fromId) {
+  const prev = lastUserMessages.get(chatId);
+  if (!prev) return null;
+  if (fromId && prev.fromId !== fromId) return null;
+  if (isMessageUsed(chatId, prev.message_id)) return null;
+  if (Date.now() - prev.date > PREVIOUS_MESSAGE_WINDOW_MS) return null;
+  return prev;
+}
+
+function isReplyToBot(ctx) {
+  const reply = ctx.message?.reply_to_message;
+  const botId = ctx.botInfo?.id || bot.botInfo?.id;
+  if (!reply || !botId) return false;
+  return reply.from?.id === botId;
+}
+
+function shouldHandleMessage(ctx) {
+  const chatType = ctx.chat?.type;
+  if (chatType === 'private') return true;
+
+  if (messageMentionsBot(ctx.message)) return true;
+  if (isReplyToBot(ctx)) return true;
+  if (consumePromptWindow(ctx.chat.id)) return true;
+
+  return false;
+}
+
+function getUsedBucket(chatId) {
+  if (!usedMessagesByChat.has(chatId)) {
+    usedMessagesByChat.set(chatId, { set: new Set(), queue: [] });
+  }
+  return usedMessagesByChat.get(chatId);
+}
+
+function markMessagesUsed(chatId, ids = []) {
+  const bucket = getUsedBucket(chatId);
+  for (const id of ids) {
+    if (!id) continue;
+    if (!bucket.set.has(id)) {
+      bucket.queue.push(id);
+    }
+    bucket.set.add(id);
+  }
+
+  // Keep at most 20 entries to avoid unbounded growth.
+  while (bucket.queue.length > 20) {
+    const old = bucket.queue.shift();
+    bucket.set.delete(old);
+  }
+}
+
+function isMessageUsed(chatId, messageId) {
+  if (!messageId) return false;
+  const bucket = usedMessagesByChat.get(chatId);
+  if (!bucket) return false;
+  return bucket.set.has(messageId);
+}
+
 bot.start(async (ctx) => {
   await ctx.reply('Send me a link and I will add it to your Watch2Gether room. Try /help for details.');
+  markPrompt(ctx.chat.id);
 });
 
 bot.command('help', async (ctx) => {
@@ -145,37 +264,57 @@ bot.command('clear', async (ctx) => {
   }
 });
 
-bot.on('text', async (ctx) => {
+bot.on('message', async (ctx) => {
   // Ignore commands here, handled above.
-  const entities = ctx.message.entities || [];
+  const entities = ctx.message.entities || ctx.message.caption_entities || [];
   if (entities.some((e) => e.type === 'bot_command')) {
     return;
   }
 
-  const chatType = ctx.chat?.type;
-  if (chatType !== 'private' && !messageMentionsBot(ctx.message)) {
+  if (!shouldHandleMessage(ctx)) {
+    rememberLastUserMessage(ctx.message);
     return;
   }
 
-  const { url, invalid } = findUrl(ctx);
-  if (invalid && !url) {
-    await ctx.reply('That doesn’t look like a valid URL.');
-    return;
-  }
-  if (!url) {
-    await ctx.reply('Send me a link to add. Try /help');
-    return;
-  }
+  const priorMessage = messageMentionsBot(ctx.message)
+    ? recentPreviousMessage(ctx.chat.id, ctx.from?.id)
+    : null;
 
+  const { url, invalid, sourceMessageId } = findUrl(ctx, priorMessage);
   const chatId = ctx.chat.id;
+  const invalidFromCurrentMessage = invalid && sourceMessageId === ctx.message?.message_id;
+
+  if (invalidFromCurrentMessage && !url) {
+    await ctx.reply('That doesn’t look like a valid URL.');
+    rememberLastUserMessage(ctx.message);
+    return;
+  }
+  if (!url || invalid) {
+    const explicitInteraction = messageMentionsBot(ctx.message) || isReplyToBot(ctx) || ctx.chat.type === 'private';
+    if (!explicitInteraction) {
+      rememberLastUserMessage(ctx.message);
+      return;
+    }
+    await ctx.reply('Send me a link to add. Try /help');
+    markPrompt(chatId);
+    rememberLastUserMessage(ctx.message);
+    return;
+  }
 
   try {
     const streamkey = await ensureRoom(chatId);
     await addToPlaylist(streamkey, url);
     await ctx.reply(`Added ✅\nRoom: ${buildRoomLink(streamkey)}`);
+    const idsToMark = [sourceMessageId, ctx.message?.message_id].filter(Boolean);
+    markMessagesUsed(chatId, idsToMark);
   } catch (err) {
     console.error('Error adding URL', err);
     await ctx.reply('Couldn’t add that (W2G error). Try again.');
+  } finally {
+    if (priorMessage) {
+      lastUserMessages.delete(ctx.chat.id); // prevent reusing the same prior message repeatedly
+    }
+    rememberLastUserMessage(ctx.message);
   }
 });
 

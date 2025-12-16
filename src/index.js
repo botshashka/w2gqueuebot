@@ -4,10 +4,9 @@ const { getRoom, setRoom } = require('./db');
 const { createRoom, addToPlaylist } = require('./w2g');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
-const botUsername = (process.env.BOT_USERNAME || '').replace('@', '').toLowerCase();
 
-if (!token || !botUsername || !process.env.W2G_API_KEY) {
-  console.error('Missing required env vars: TELEGRAM_BOT_TOKEN, BOT_USERNAME, W2G_API_KEY');
+if (!token || !process.env.W2G_API_KEY) {
+  console.error('Missing required env vars: TELEGRAM_BOT_TOKEN, W2G_API_KEY');
   process.exit(1);
 }
 
@@ -41,16 +40,15 @@ function extractFromEntities(message) {
   return null;
 }
 
-function extractFromText(text) {
-  if (!text) return null;
-  const match = text.match(/https?:\/\/\S+/i);
-  return match ? match[0] : null;
-}
-
 function validateCandidate(url) {
   if (!url) return { url: null, invalid: false };
+  let candidate = url;
+  if (!candidate.match(/^https?:\/\//i)) {
+    candidate = 'https://' + candidate;
+  }
+
   try {
-    const parsed = new URL(url);
+    const parsed = new URL(candidate);
     // Only allow http/https
     if (!['http:', 'https:'].includes(parsed.protocol.toLowerCase())) {
       return { url: null, invalid: false };
@@ -69,15 +67,15 @@ function findUrl(ctx, previousMessage) {
   const candidates = [
     { raw: extractFromEntities(msg), sourceId: msg?.message_id },
     { raw: canUseReply ? extractFromEntities(reply) : null, sourceId: canUseReply ? reply.message_id : null },
-    { raw: extractFromText(getText(msg)), sourceId: msg?.message_id },
-    { raw: canUseReply ? extractFromText(getText(reply)) : null, sourceId: canUseReply ? reply.message_id : null },
+    // Removed raw text scanning
   ];
 
   if (previousMessage) {
-    candidates.push(
-      { raw: extractFromEntities(previousMessage), sourceId: previousMessage.message_id },
-      { raw: extractFromText(getText(previousMessage)), sourceId: previousMessage.message_id }
-    );
+    // If previousMessage has a stored URL, use it directly.
+    // The structure of previousMessage is now { url: string|null, ... }
+    if (previousMessage.url) {
+      candidates.push({ raw: previousMessage.url, sourceId: previousMessage.message_id });
+    }
   }
 
   for (const raw of candidates) {
@@ -91,9 +89,14 @@ function findUrl(ctx, previousMessage) {
   return { url: null, invalid: false, sourceMessageId: null };
 }
 
-function messageMentionsBot(message) {
+function messageMentionsBot(ctx) {
+  const message = ctx.message;
   if (!message) return false;
-  const mentionTag = `@${botUsername}`;
+
+  const rawUsername = ctx.botInfo?.username || bot.botInfo?.username || '';
+  const username = rawUsername.replace('@', '').toLowerCase();
+  const mentionTag = `@${username}`;
+
   const text = getText(message);
   const entities = message.entities || message.caption_entities || [];
 
@@ -143,15 +146,15 @@ function consumePromptWindow(chatId) {
 function snapshotUserMessage(message) {
   if (!message || !message.chat || !message.from || message.from.is_bot) return null;
   const timestampMs = (message.date ? message.date * 1000 : Date.now());
+  // Privacy: Extract URL immediately and discard text.
+  const urlCandidate = extractFromEntities(message);
+
   return {
     chatId: message.chat.id,
     fromId: message.from.id,
     date: timestampMs,
     message_id: message.message_id,
-    text: message.text,
-    caption: message.caption,
-    entities: message.entities,
-    caption_entities: message.caption_entities,
+    url: urlCandidate, // Store only the URL (or null)
   };
 }
 
@@ -181,7 +184,7 @@ function shouldHandleMessage(ctx) {
   const chatType = ctx.chat?.type;
   if (chatType === 'private') return true;
 
-  if (messageMentionsBot(ctx.message)) return true;
+  if (messageMentionsBot(ctx)) return true;
   if (isReplyToBot(ctx)) return true;
   if (consumePromptWindow(ctx.chat.id)) return true;
 
@@ -229,8 +232,8 @@ bot.command('help', async (ctx) => {
     'Add links to your Watch2Gether room for this chat.',
     '',
     'Groups:',
-    `- Reply with @${botUsername} to a message that has a URL`,
-    `- Or write @${botUsername} <url>`,
+    `- Reply with @${ctx.botInfo?.username || bot.botInfo?.username} to a message that has a URL`,
+    `- Or write @${ctx.botInfo?.username || bot.botInfo?.username} <url>`,
     '',
     'DMs:',
     '- Send any message with a URL',
@@ -276,7 +279,7 @@ bot.on('message', async (ctx) => {
     return;
   }
 
-  const priorMessage = messageMentionsBot(ctx.message)
+  const priorMessage = messageMentionsBot(ctx)
     ? recentPreviousMessage(ctx.chat.id, ctx.from?.id)
     : null;
 
@@ -290,7 +293,7 @@ bot.on('message', async (ctx) => {
     return;
   }
   if (!url || invalid) {
-    const explicitInteraction = messageMentionsBot(ctx.message) || isReplyToBot(ctx) || ctx.chat.type === 'private';
+    const explicitInteraction = messageMentionsBot(ctx) || isReplyToBot(ctx) || ctx.chat.type === 'private';
     if (!explicitInteraction) {
       rememberLastUserMessage(ctx.message);
       return;
